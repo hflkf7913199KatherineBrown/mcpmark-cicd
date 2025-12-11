@@ -1,0 +1,213 @@
+name: PR Automation Workflow
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+      - run: npm ci
+      - name: Run ESLint
+        id: eslint
+        run: npm run lint
+        continue-on-error: true
+      - name: Run Prettier Check
+        id: prettier
+        run: npx prettier --check .
+        continue-on-error: true
+      - name: Post Code Quality Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const eslintFailed = '${{ steps.eslint.outcome }}' === 'failure';
+            const prettierFailed = '${{ steps.prettier.outcome }}' === 'failure';
+            let report = "## Code Quality Report\n\n";
+            report += "### ESLint\n";
+            report += eslintFailed ? "❌ **ESLint checks failed!** Please fix the linting errors.\n" : "✅ **ESLint checks passed!**\n";
+            report += "\n### Prettier\n";
+            report += prettierFailed ? "❌ **Prettier formatting checks failed!** Please run `npx prettier --write .` to fix.\n" : "✅ **Prettier checks passed!**\n";
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: report
+            });
+      - name: Fail job if checks failed
+        if: steps.eslint.outcome == 'failure' || steps.prettier.outcome == 'failure'
+        run: exit 1
+
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+      - run: npm ci
+      - name: Run Tests with Coverage
+        id: tests
+        run: npm test -- --coverage
+        continue-on-error: true
+      - name: Upload Coverage Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          if-no-files-found: warn
+      - name: Post Test Coverage Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const testsFailed = '${{ steps.tests.outcome }}' === 'failure';
+            const fs = require('fs');
+            let coverageSummary = "No coverage summary available (check if tests generate coverage).";
+            try {
+              if (fs.existsSync('coverage/coverage-summary.json')) {
+                const summary = JSON.parse(fs.readFileSync('coverage/coverage-summary.json', 'utf8'));
+                const totalLines = summary.total.lines;
+                const totalBranches = summary.total.branches;
+                const totalFunctions = summary.total.functions;
+                const totalStatements = summary.total.statements;
+                coverageSummary = `
+                - Lines: ${totalLines.pct}% (${totalLines.covered}/${totalLines.total})
+                - Branches: ${totalBranches.pct}% (${totalBranches.covered}/${totalBranches.total})
+                - Functions: ${totalFunctions.pct}% (${totalFunctions.covered}/${totalFunctions.total})
+                - Statements: ${totalStatements.pct}% (${totalStatements.covered}/${totalStatements.total})
+                `;
+              }
+            } catch (e) {
+              console.log("Could not read coverage summary:", e);
+            }
+            let report = "## Test Coverage Report\n\n";
+            report += testsFailed ? "❌ **Tests failed!** Please fix the failing tests.\n" : "✅ **All tests passed!**\n";
+            report += "\n### Coverage Summary\n" + coverageSummary + "\n";
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: report
+            });
+      - name: Fail job if tests failed
+        if: steps.tests.outcome == 'failure'
+        run: exit 1
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+      - run: npm ci
+      - name: Dependency Vulnerability Check (npm audit)
+        id: npm-audit
+        run: |
+          npm audit --json > npm-audit.json
+          VULN_COUNT=$(jq '[.advisories[] | select(.severity == "high" or .severity == "critical")] | length' npm-audit.json)
+          if [ $VULN_COUNT -gt 0 ]; then
+            echo "high_crit_vulns=$VULN_COUNT" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+      - name: Secret Scan (Gitleaks)
+        id: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: --path=. --report=secret-scan.json
+        continue-on-error: true
+      - name: Post Security Scan Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const highCritVulns = '${{ steps.npm-audit.outputs.high_crit_vulns }}' || 0;
+            const secretScanFailed = '${{ steps.gitleaks.outcome }}' === 'failure';
+            let report = "## Security Scan Report\n\n";
+            report += "### Dependencies (Vulnerabilities)\n";
+            if (highCritVulns > 0) {
+              report += `⚠️ **${highCritVulns} High/Critical dependency vulnerabilities found!** Check the npm audit output for details.\n`;
+            } else if ('${{ steps.npm-audit.outcome }}' === 'failure') {
+              report += "⚠️ **Dependency vulnerabilities found (low/moderate)!** Check the npm audit output for details.\n";
+            } else {
+              report += "✅ **No dependency vulnerabilities found!**\n";
+            }
+            report += "\n### Secrets Scan\n";
+            if (secretScanFailed) {
+              report += "⚠️ **Potential secrets found!** Check the secret scan output for details.\n";
+            } else {
+              report += "✅ **No secrets found in code changes!**\n";
+            }
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: report
+            });
+      - name: Fail job if security issues found
+        if: steps.npm-audit.outputs.high_crit_vulns > 0 || steps.gitleaks.outcome == 'failure'
+        run: exit 1
+
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+      - run: npm ci
+      - name: Build Application
+        id: build
+        run: npm run build
+        continue-on-error: true
+      - name: Validate Endpoints (Placeholder)
+        id: endpoints
+        run: |
+          echo "Endpoint validation is a placeholder - replace with actual checks for your app"
+        continue-on-error: true
+      - name: Upload Build Preview Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-preview
+          path: |
+            dist/
+            build/
+          if-no-files-found: warn
+      - name: Post Build Validation Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const buildFailed = '${{ steps.build.outcome }}' === 'failure';
+            const endpointsFailed = '${{ steps.endpoints.outcome }}' === 'failure';
+            let report = "## Build Validation\n\n";
+            if (buildFailed) {
+              report += "❌ **Build failed!** Please fix build errors.\n";
+            } else {
+              report += "✅ **Build succeeded!**\n";
+            }
+            report += "\n### Endpoint Validation\n";
+            if (endpointsFailed) {
+              report += "❌ **Endpoint validation failed!** Check endpoint health.\n";
+            } else {
+              report += "ℹ️ **Endpoint validation (placeholder):** Replace this step with actual HTTP checks for your app's endpoints.\n";
+            }
+            report += "\n### Build Preview Artifact\n✅ **Build artifacts uploaded** (see the 'Artifacts' section of this workflow run for the preview build).\n";
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: report
+            });
+      - name: Fail job if build/endpoints failed
+        if: steps.build.outcome == 'failure' || steps.endpoints.outcome == 'failure'
+        run: exit 1
